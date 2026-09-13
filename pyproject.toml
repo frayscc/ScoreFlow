@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scoreflow"
+version = "0.1.0"
+description = "Local-first classroom score OMR tool"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi==0.128.8",
+  "uvicorn==0.39.0",
+  "reportlab==4.4.9",
+  "qrcode[pil]==8.2",
+  "pypdfium2==4.30.0",
+  "numpy==2.0.2; python_version < '3.10'",
+  "numpy==2.2.6; python_version >= '3.10'",
+  "opencv-python-headless==4.12.0.88",
+  "python-multipart==0.0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "backend"}
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["tests"]
