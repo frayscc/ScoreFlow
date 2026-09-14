@@ -31,15 +31,28 @@ def decode_identity(image: np.ndarray) -> tuple[Optional[dict[str, Any]], np.nda
         gray = cv2.cvtColor(oriented, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         payload, points = "", None
-        for candidate in (oriented, gray, binary):
+        height, width = oriented.shape[:2]
+        qr_region = oriented[0:int(height * .34), int(width * .60):width]
+        qr_gray = cv2.cvtColor(qr_region, cv2.COLOR_BGR2GRAY)
+        _, qr_binary = cv2.threshold(qr_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        candidates = [
+            (cv2.resize(qr_region, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC), True),
+            (cv2.resize(qr_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC), True),
+            (cv2.resize(qr_binary, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST), True),
+            (oriented, False), (gray, False), (binary, False),
+        ]
+        trusted_region = False
+        for candidate, is_region in candidates:
             payload, points, _ = cv2.QRCodeDetector().detectAndDecode(candidate)
             if payload and points is not None:
+                trusted_region = is_region
                 break
         if not payload or points is None:
             continue
-        center = points.reshape(-1, 2).mean(axis=0)
-        if center[0] <= oriented.shape[1] * 0.6 or center[1] >= oriented.shape[0] * 0.4:
-            continue
+        if not trusted_region:
+            center = points.reshape(-1, 2).mean(axis=0)
+            if center[0] <= oriented.shape[1] * 0.6 or center[1] >= oriented.shape[0] * 0.4:
+                continue
         if payload.startswith("SF1|"):
             try:
                 _, project, period, sheet, face, template, layout_hash = payload.split("|")

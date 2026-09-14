@@ -35,6 +35,29 @@ def test_project_and_custom_week_period_api():
         assert period.json()["name"] == "第1—2周"
 
 
+def test_v2_roster_and_grouping_api(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "data_dir", lambda: tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        client.get(f"/session/bootstrap?token={SESSION_TOKEN}", follow_redirects=False)
+        csrf = client.get("/api/session").json()["csrf_token"]
+        headers = {"x-scoreflow-csrf": csrf, "origin": "http://127.0.0.1:8765"}
+        project = client.post("/api/projects", json={"class_name":"粘贴名单班","school_year":"2026","group_count":2}, headers=headers).json()
+        text = "学号 姓名\n01 张三\n2，李四"
+        preview = client.post(f"/api/projects/{project['id']}/roster/preview", json={"text":text}, headers=headers).json()
+        assert preview["valid"] and preview["count"] == 2 and preview["summary"]["new"] == 2
+        imported = client.post(f"/api/projects/{project['id']}/roster/import", json={"text":text}, headers=headers)
+        assert imported.status_code == 201 and imported.json()["inserted"] == 2
+        assert client.post(f"/api/projects/{project['id']}/roster/import", json={"text":text}, headers=headers).json()["inserted"] == 0
+        period = client.post(f"/api/projects/{project['id']}/periods", json={"name":"第1周","start_date":"2026-09-01","expected_end_date":"2026-09-07"}, headers=headers).json()
+        draft = client.get(f"/api/periods/{period['id']}/grouping").json()
+        members = [{"student_id":member["student_id"],"group_number":index+1} for index,member in enumerate(draft["members"])]
+        leaders = {str(index+1):member["student_id"] for index,member in enumerate(draft["members"])}
+        saved = client.put(f"/api/periods/{period['id']}/grouping", json={"revision":draft["revision"],"members":members,"leaders":leaders}, headers=headers)
+        assert saved.status_code == 200 and saved.json()["revision"] == draft["revision"] + 1
+        assert client.post(f"/api/periods/{period['id']}/start", json={}, headers=headers).status_code == 201
+        assert client.get(f"/api/periods/{period['id']}/grouping").json()["editable"] is False
+
+
 def test_full_phase2_flow_generates_downloadable_real_roster_pdf(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module, "data_dir", lambda: tmp_path)
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:

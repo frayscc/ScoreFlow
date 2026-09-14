@@ -13,7 +13,7 @@ from typing import Iterable, Iterator, Optional
 from .scoring import aggregate_observations, summarize_results
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 MIGRATION_1 = """
 PRAGMA foreign_keys = ON;
@@ -29,6 +29,7 @@ CREATE TABLE students(
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
   student_number TEXT NOT NULL, name TEXT NOT NULL, group_number INTEGER NOT NULL CHECK(group_number BETWEEN 1 AND 20),
   is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)), sort_order INTEGER NOT NULL,
+  is_unassigned INTEGER NOT NULL DEFAULT 0 CHECK(is_unassigned IN (0,1)),
   UNIQUE(project_id, student_number)
 );
 CREATE TABLE class_groups(
@@ -47,6 +48,19 @@ CREATE TABLE periods(
   start_date TEXT NOT NULL, expected_end_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft'
     CHECK(status IN ('draft','active','settling','closed')),
   base_score INTEGER NOT NULL DEFAULT 100, started_at TEXT, closed_at TEXT, result_version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE period_grouping_revisions(
+  period_id TEXT PRIMARY KEY REFERENCES periods(id), revision INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE period_draft_members(
+  period_id TEXT NOT NULL REFERENCES periods(id), student_id TEXT NOT NULL REFERENCES students(id),
+  group_number INTEGER CHECK(group_number BETWEEN 1 AND 20), sort_order INTEGER NOT NULL,
+  PRIMARY KEY(period_id,student_id), UNIQUE(period_id,sort_order)
+);
+CREATE TABLE period_draft_groups(
+  period_id TEXT NOT NULL REFERENCES periods(id), group_number INTEGER NOT NULL CHECK(group_number BETWEEN 1 AND 20),
+  leader_student_id TEXT REFERENCES students(id), PRIMARY KEY(period_id,group_number)
 );
 CREATE TABLE period_students(
   period_id TEXT NOT NULL REFERENCES periods(id), student_id TEXT NOT NULL REFERENCES students(id),
@@ -130,7 +144,7 @@ CREATE TABLE report_exports(
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(period_id,result_version,variant,is_draft,source_digest)
 );
-UPDATE schema_version SET version=8;
+UPDATE schema_version SET version=9;
 """
 
 MIGRATION_2 = """
@@ -246,6 +260,33 @@ UPDATE schema_version SET version=8;
 PRAGMA user_version=8;
 """
 
+MIGRATION_9 = """
+ALTER TABLE students ADD COLUMN is_unassigned INTEGER NOT NULL DEFAULT 0 CHECK(is_unassigned IN (0,1));
+CREATE TABLE period_grouping_revisions(
+  period_id TEXT PRIMARY KEY REFERENCES periods(id), revision INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE period_draft_members(
+  period_id TEXT NOT NULL REFERENCES periods(id), student_id TEXT NOT NULL REFERENCES students(id),
+  group_number INTEGER CHECK(group_number BETWEEN 1 AND 20), sort_order INTEGER NOT NULL,
+  PRIMARY KEY(period_id,student_id), UNIQUE(period_id,sort_order)
+);
+CREATE TABLE period_draft_groups(
+  period_id TEXT NOT NULL REFERENCES periods(id), group_number INTEGER NOT NULL CHECK(group_number BETWEEN 1 AND 20),
+  leader_student_id TEXT REFERENCES students(id), PRIMARY KEY(period_id,group_number)
+);
+INSERT INTO period_grouping_revisions(period_id)
+  SELECT id FROM periods WHERE status='draft';
+INSERT INTO period_draft_members(period_id,student_id,group_number,sort_order)
+  SELECT p.id,s.id,s.group_number,s.sort_order FROM periods p JOIN students s ON s.project_id=p.project_id
+  WHERE p.status='draft' AND s.is_active=1;
+INSERT INTO period_draft_groups(period_id,group_number,leader_student_id)
+  SELECT p.id,cg.group_number,cg.leader_student_id FROM periods p
+  JOIN class_groups cg ON cg.project_id=p.project_id WHERE p.status='draft';
+UPDATE schema_version SET version=9;
+PRAGMA user_version=9;
+"""
+
 
 class Store:
     def __init__(self, path: Path):
@@ -307,6 +348,9 @@ class Store:
                 current = 7
             if current == 7:
                 self.connection.executescript(MIGRATION_8)
+                current = 8
+            if current == 8:
+                self.connection.executescript(MIGRATION_9)
             elif current > SCHEMA_VERSION:
                 raise RuntimeError(f"数据库版本 {current} 高于程序支持版本 {SCHEMA_VERSION}")
 
@@ -335,7 +379,7 @@ class Store:
     def list_students(self, project_id: str) -> list[dict[str, object]]:
         with self._lock:
             rows = self.connection.execute(
-                "SELECT s.id,s.student_number,s.name,s.group_number,s.is_active,s.sort_order,"
+                "SELECT s.id,s.student_number,s.name,CASE WHEN s.is_unassigned=1 THEN NULL ELSE s.group_number END group_number,s.is_active,s.sort_order,"
                 "CASE WHEN cg.leader_student_id=s.id THEN 1 ELSE 0 END is_leader "
                 "FROM students s LEFT JOIN class_groups cg ON cg.project_id=s.project_id AND cg.group_number=s.group_number "
                 "WHERE s.project_id=? ORDER BY s.group_number,s.sort_order",
@@ -349,7 +393,7 @@ class Store:
             student = self.connection.execute("SELECT * FROM students WHERE id=? AND project_id=?", (student_id, project_id)).fetchone()
             if not project or not student or not name.strip() or not 1 <= group_number <= project["group_count"]:
                 raise ValueError("学生信息或组号无效")
-            self.connection.execute("UPDATE students SET name=?,group_number=? WHERE id=?", (name.strip(), group_number, student_id))
+            self.connection.execute("UPDATE students SET name=?,group_number=?,is_unassigned=0 WHERE id=?", (name.strip(), group_number, student_id))
             self.connection.execute("UPDATE class_groups SET leader_student_id=NULL WHERE project_id=? AND leader_student_id=?", (project_id, student_id))
             if is_leader:
                 self.connection.execute("UPDATE class_groups SET leader_student_id=? WHERE project_id=? AND group_number=?", (student_id, project_id, group_number))
@@ -408,8 +452,6 @@ class Store:
             seen.add(number)
             normalized.append((str(uuid.uuid4()), project_id, number, name, group, index, bool(row.get("is_leader", False))))
         ids = []
-        if len(normalized) > 49:
-            raise ValueError("当前 A4 模板最多容纳 49 名学生")
         try:
             with self._lock, self.connection:
                 for student_id, pid, number, name, group, order, _ in normalized:
@@ -423,15 +465,171 @@ class Store:
                         if self.connection.execute("SELECT leader_student_id FROM class_groups WHERE project_id=? AND group_number=?", (project_id, group)).fetchone()[0]:
                             raise ValueError(f"第 {group} 组有多个组长")
                         self.connection.execute("UPDATE class_groups SET leader_student_id=? WHERE project_id=? AND group_number=?", (student_id, project_id, group))
+                self._append_students_to_drafts(project_id, [(row[0], row[4]) for row in normalized], self.connection)
         except sqlite3.IntegrityError as exc:
             raise ValueError("学号重复或名单关联无效，未导入任何学生") from exc
         return ids
+
+    @staticmethod
+    def _canonical_number(value: object) -> str:
+        text = str(value).strip()
+        return str(int(text)) if text.isdigit() and int(text) > 0 else text
+
+    def roster_import_preview(self, project_id: str, rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        with self._lock:
+            if not self.connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise ValueError("项目不存在")
+            existing_rows = self.connection.execute(
+                "SELECT id,student_number,name,group_number,is_unassigned FROM students WHERE project_id=? AND is_active=1",
+                (project_id,),
+            ).fetchall()
+        existing = {self._canonical_number(row["student_number"]): row for row in existing_rows}
+        preview = []
+        for row in rows:
+            number = self._canonical_number(row["student_number"])
+            current = existing.get(number)
+            status = "new" if not current else ("unchanged" if current["name"] == row["name"] else "name_difference")
+            preview.append({**row, "student_number": number, "status": status,
+                            "existing_name": current["name"] if current else None,
+                            "existing_student_id": current["id"] if current else None,
+                            "existing_group_number": None if current and current["is_unassigned"] else (current["group_number"] if current else None)})
+        return preview
+
+    def import_roster_students(self, project_id: str, rows: list[dict[str, object]]) -> dict[str, int]:
+        preview = self.roster_import_preview(project_id, rows)
+        new_rows = [row for row in preview if row["status"] == "new"]
+        with self._lock, self.connection:
+            start = self.connection.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM students WHERE project_id=?", (project_id,)).fetchone()[0]
+            inserted = []
+            for index, row in enumerate(new_rows):
+                student_id = str(uuid.uuid4())
+                self.connection.execute(
+                    "INSERT INTO students(id,project_id,student_number,name,group_number,sort_order,is_unassigned) VALUES(?,?,?,?,1,?,1)",
+                    (student_id, project_id, row["student_number"], str(row["name"]).strip(), start + index),
+                )
+                inserted.append((student_id, None))
+            self._append_students_to_drafts(project_id, inserted, self.connection)
+        return {"inserted": len(new_rows), "unchanged": sum(row["status"] == "unchanged" for row in preview),
+                "name_differences": sum(row["status"] == "name_difference" for row in preview)}
+
+    @staticmethod
+    def _append_students_to_drafts(project_id: str, students: list[tuple[str, Optional[int]]], connection: sqlite3.Connection) -> None:
+        drafts = connection.execute("SELECT id FROM periods WHERE project_id=? AND status='draft'", (project_id,)).fetchall()
+        for draft in drafts:
+            next_order = connection.execute(
+                "SELECT COALESCE(MAX(sort_order),-1)+1 FROM period_draft_members WHERE period_id=?", (draft["id"],)
+            ).fetchone()[0]
+            for offset, (student_id, group_number) in enumerate(students):
+                connection.execute(
+                    "INSERT OR IGNORE INTO period_draft_members(period_id,student_id,group_number,sort_order) VALUES(?,?,?,?)",
+                    (draft["id"], student_id, group_number, next_order + offset),
+                )
+            if students:
+                connection.execute(
+                    "UPDATE period_grouping_revisions SET revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE period_id=?",
+                    (draft["id"],),
+                )
 
     def create_period(self, project_id: str, name: str, start_date: str, expected_end_date: str) -> str:
         period_id = str(uuid.uuid4())
         with self._lock, self.connection:
             self.connection.execute("INSERT INTO periods(id,project_id,name,start_date,expected_end_date) VALUES(?,?,?,?,?)", (period_id, project_id, name, start_date, expected_end_date))
+            self.connection.execute("INSERT INTO period_grouping_revisions(period_id) VALUES(?)", (period_id,))
+            self.connection.execute(
+                "INSERT INTO period_draft_members(period_id,student_id,group_number,sort_order) "
+                "SELECT ?,id,CASE WHEN is_unassigned=1 THEN NULL ELSE group_number END,sort_order FROM students "
+                "WHERE project_id=? AND is_active=1 ORDER BY sort_order", (period_id, project_id)
+            )
+            self.connection.execute(
+                "INSERT INTO period_draft_groups(period_id,group_number,leader_student_id) "
+                "SELECT ?,cg.group_number,CASE WHEN s.is_unassigned=0 THEN cg.leader_student_id ELSE NULL END "
+                "FROM class_groups cg LEFT JOIN students s ON s.id=cg.leader_student_id WHERE cg.project_id=?",
+                (period_id, project_id),
+            )
         return period_id
+
+    def grouping_draft(self, period_id: str) -> dict[str, object]:
+        with self._lock:
+            period = self.connection.execute(
+                "SELECT p.id,p.status,p.project_id,pr.group_count FROM periods p JOIN projects pr ON pr.id=p.project_id WHERE p.id=?",
+                (period_id,),
+            ).fetchone()
+            if not period:
+                raise ValueError("周期不存在")
+            if period["status"] == "draft":
+                revision = self.connection.execute("SELECT revision FROM period_grouping_revisions WHERE period_id=?", (period_id,)).fetchone()
+                members = [dict(row) for row in self.connection.execute(
+                    "SELECT pdm.student_id,s.student_number,s.name,pdm.group_number,pdm.sort_order "
+                    "FROM period_draft_members pdm JOIN students s ON s.id=pdm.student_id WHERE pdm.period_id=? ORDER BY pdm.sort_order",
+                    (period_id,),
+                )]
+                leaders = {str(row["group_number"]): row["leader_student_id"] for row in self.connection.execute(
+                    "SELECT group_number,leader_student_id FROM period_draft_groups WHERE period_id=? ORDER BY group_number", (period_id,)
+                )}
+                editable = True
+            else:
+                revision = None
+                members = [dict(row) for row in self.connection.execute(
+                    "SELECT ps.student_id,ps.student_number,ps.name,ps.group_number,ps.row_index sort_order "
+                    "FROM period_students ps WHERE ps.period_id=? ORDER BY ps.row_index", (period_id,)
+                )]
+                leaders = {str(row["group_number"]): row["leader_student_id"] for row in self.connection.execute(
+                    "SELECT group_number,leader_student_id FROM period_groups WHERE period_id=? ORDER BY group_number", (period_id,)
+                )}
+                editable = False
+            return {"period_id": period_id, "editable": editable, "revision": revision["revision"] if revision else None,
+                    "group_count": period["group_count"], "members": members, "leaders": leaders}
+
+    def save_grouping_draft(self, period_id: str, revision: int, members: list[dict[str, object]], leaders: dict[str, Optional[str]]) -> int:
+        with self._lock, self.connection:
+            period = self.connection.execute(
+                "SELECT p.project_id,pr.group_count FROM periods p JOIN projects pr ON pr.id=p.project_id WHERE p.id=? AND p.status='draft'",
+                (period_id,),
+            ).fetchone()
+            if not period:
+                raise ValueError("只有草稿周期可以调整分组")
+            current = self.connection.execute("SELECT revision FROM period_grouping_revisions WHERE period_id=?", (period_id,)).fetchone()
+            if not current or current["revision"] != revision:
+                raise ValueError("分组草稿已在别处更新，请刷新后重试")
+            expected = {row["id"] for row in self.connection.execute(
+                "SELECT id FROM students WHERE project_id=? AND is_active=1", (period["project_id"],)
+            )}
+            received = [str(row.get("student_id", "")) for row in members]
+            if len(received) != len(set(received)) or set(received) != expected:
+                raise ValueError("分组草稿必须且只能包含当前全部学生")
+            normalized = []
+            group_by_student: dict[str, Optional[int]] = {}
+            for order, row in enumerate(members):
+                group = row.get("group_number")
+                group = None if group is None else int(group)
+                if group is not None and not 1 <= group <= period["group_count"]:
+                    raise ValueError("草稿中存在无效组号")
+                student_id = str(row["student_id"])
+                group_by_student[student_id] = group
+                normalized.append((period_id, student_id, group, order))
+            normalized_leaders: list[tuple[str, int, Optional[str]]] = []
+            for group in range(1, period["group_count"] + 1):
+                leader = leaders.get(str(group))
+                if leader is not None and group_by_student.get(str(leader)) != group:
+                    raise ValueError(f"第{group}组组长必须来自本组成员")
+                normalized_leaders.append((period_id, group, str(leader) if leader else None))
+            self.connection.execute("DELETE FROM period_draft_groups WHERE period_id=?", (period_id,))
+            self.connection.execute("DELETE FROM period_draft_members WHERE period_id=?", (period_id,))
+            self.connection.executemany(
+                "INSERT INTO period_draft_members(period_id,student_id,group_number,sort_order) VALUES(?,?,?,?)", normalized
+            )
+            self.connection.executemany(
+                "INSERT INTO period_draft_groups(period_id,group_number,leader_student_id) VALUES(?,?,?)", normalized_leaders
+            )
+            new_revision = revision + 1
+            self.connection.execute(
+                "UPDATE period_grouping_revisions SET revision=?,updated_at=CURRENT_TIMESTAMP WHERE period_id=?", (new_revision, period_id)
+            )
+            self.connection.execute(
+                "INSERT INTO audit_events(action,entity_id,details_json) VALUES('save_grouping_draft',?,?)",
+                (period_id, json.dumps({"revision": new_revision}, ensure_ascii=False)),
+            )
+            return new_revision
 
     def update_draft_period(self, period_id: str, name: str, start_date: str, expected_end_date: str) -> None:
         with self._lock, self.connection:
@@ -979,26 +1177,49 @@ class Store:
             period = self.connection.execute("SELECT * FROM periods WHERE id=?", (period_id,)).fetchone()
             if not period or period["status"] != "draft":
                 raise ValueError("只有草稿周期可以开始")
+            project = self.connection.execute("SELECT group_count FROM projects WHERE id=?", (period["project_id"],)).fetchone()
             students = self.connection.execute(
-                "SELECT * FROM students WHERE project_id=? AND is_active=1 ORDER BY group_number,sort_order,student_number", (period["project_id"],)
+                "SELECT s.*,pdm.group_number draft_group,pdm.sort_order draft_order FROM period_draft_members pdm "
+                "JOIN students s ON s.id=pdm.student_id WHERE pdm.period_id=? AND s.is_active=1 "
+                "ORDER BY pdm.group_number,pdm.sort_order,s.student_number", (period_id,)
             ).fetchall()
             if not students:
                 raise ValueError("名单为空")
+            if len(students) > 49:
+                raise ValueError("当前 A4 纸表模板最多容纳49人，请调整名单或模板")
+            if any(student["draft_group"] is None for student in students):
+                raise ValueError("仍有学生未分组，不能开始周期")
             rules = self.connection.execute("SELECT * FROM rules WHERE project_id=? AND is_active=1 ORDER BY side,sort_order", (period["project_id"],)).fetchall()
             if sum(rule["side"] == "front" for rule in rules) > 7 or sum(rule["side"] == "back" for rule in rules) > 6:
                 raise ValueError("启用项目超出纸表容量")
-            leaders = self.connection.execute("SELECT * FROM class_groups WHERE project_id=? ORDER BY group_number", (period["project_id"],)).fetchall()
-            member_ids = {student["id"]: student["group_number"] for student in students}
+            leaders = self.connection.execute("SELECT * FROM period_draft_groups WHERE period_id=? ORDER BY group_number", (period_id,)).fetchall()
+            member_ids = {student["id"]: student["draft_group"] for student in students}
             if any(not group["leader_student_id"] or member_ids.get(group["leader_student_id"]) != group["group_number"] for group in leaders):
-                raise ValueError("每组组长必须来自本组当前成员")
+                raise ValueError("每组必须指定一名本组组长")
+            if len(leaders) != project["group_count"]:
+                raise ValueError("分组草稿缺少小组记录")
+            counts = {group: sum(student["draft_group"] == group for student in students) for group in range(1, project["group_count"] + 1)}
+            if any(count == 0 for count in counts.values()):
+                raise ValueError("每组至少需要一名成员")
+            if project["group_count"] == 7 and len(students) == 49 and any(count != 7 for count in counts.values()):
+                raise ValueError("当前49人、7组班级必须每组恰好7人")
             self.connection.executemany(
                 "INSERT INTO period_students(period_id,student_id,student_number,name,group_number,row_index) VALUES(?,?,?,?,?,?)",
-                [(period_id, s["id"], s["student_number"], s["name"], s["group_number"], i) for i, s in enumerate(students)],
+                [(period_id, s["id"], s["student_number"], s["name"], s["draft_group"], i) for i, s in enumerate(students)],
             )
             self.connection.executemany("INSERT INTO period_groups(period_id,group_number,leader_student_id) VALUES(?,?,?)", [(period_id, g["group_number"], g["leader_student_id"]) for g in leaders])
             self.connection.executemany(
                 "INSERT INTO period_rules(period_id,rule_id,name,side,unit_score,sort_order) VALUES(?,?,?,?,?,?)",
                 [(period_id, r["id"], r["name"], r["side"], r["unit_score"], r["sort_order"]) for r in rules],
+            )
+            self.connection.executemany(
+                "UPDATE students SET group_number=?,is_unassigned=0 WHERE id=?",
+                [(student["draft_group"], student["id"]) for student in students],
+            )
+            self.connection.execute("UPDATE class_groups SET leader_student_id=NULL WHERE project_id=?", (period["project_id"],))
+            self.connection.executemany(
+                "UPDATE class_groups SET leader_student_id=? WHERE project_id=? AND group_number=?",
+                [(group["leader_student_id"], period["project_id"], group["group_number"]) for group in leaders],
             )
             self.connection.execute("UPDATE periods SET status='active',started_at=CURRENT_TIMESTAMP WHERE id=?", (period_id,))
             return self.issue_sheet(period_id, template_id, connection=self.connection)

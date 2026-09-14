@@ -106,12 +106,17 @@ def test_schema_v6_upgrades_to_phase4_ledger_tables(tmp_path):
         store.connection.execute("DROP TABLE report_exports")
         store.connection.execute("DROP TABLE ledger_entries")
         store.connection.execute("DROP TABLE posting_batches")
+        store.connection.execute("DROP TABLE period_draft_groups")
+        store.connection.execute("DROP TABLE period_draft_members")
+        store.connection.execute("DROP TABLE period_grouping_revisions")
+        store.connection.execute("ALTER TABLE students DROP COLUMN is_unassigned")
         store.connection.execute("UPDATE schema_version SET version=6")
         store.connection.execute("PRAGMA user_version=6")
     store.close()
     upgraded = Store(path)
-    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 9
     tables = {row[0] for row in upgraded.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"posting_batches", "ledger_entries", "report_exports"}.issubset(tables)
     columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(posting_batches)")}
     assert {"front_run_id", "back_run_id"}.issubset(columns)
+    assert upgraded.connection.execute("SELECT count(*) FROM period_grouping_revisions").fetchone()[0] == 0

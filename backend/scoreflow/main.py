@@ -9,6 +9,7 @@ import socket
 import sqlite3
 import threading
 import uuid
+from urllib.parse import urlencode
 from datetime import date
 from pathlib import Path
 from typing import Literal, Optional
@@ -29,6 +30,7 @@ from .db import Store, parse_student_csv
 from .omr.template import generate_template
 from .omr.scan import ScanQueue
 from .reports import generate_period_report
+from .roster import parse_roster_text
 from .scorepack import ScorepackError, export_scorepack, restore_scorepack
 
 
@@ -73,10 +75,17 @@ def health() -> dict[str, str]:
 
 
 @app.get("/session/bootstrap")
-def bootstrap(token: str) -> RedirectResponse:
+def bootstrap(token: str, project: Optional[str] = None, period: Optional[str] = None) -> RedirectResponse:
     if not secrets.compare_digest(token, SESSION_TOKEN):
         raise HTTPException(status_code=403, detail="会话凭据无效")
-    response = RedirectResponse("/", status_code=303)
+    query = {}
+    for key, value in (("project", project), ("period", period)):
+        if value:
+            try:
+                query[key] = str(uuid.UUID(value))
+            except ValueError:
+                raise HTTPException(status_code=422, detail="页面定位参数无效")
+    response = RedirectResponse("/" + (f"?{urlencode(query)}" if query else ""), status_code=303)
     response.set_cookie("scoreflow_session", SESSION_TOKEN, httponly=True, samesite="strict")
     return response
 
@@ -102,6 +111,21 @@ class ProjectInput(BaseModel):
 
 class CsvImportInput(BaseModel):
     csv_text: str = Field(min_length=1, max_length=200_000)
+
+
+class RosterTextInput(BaseModel):
+    text: str = Field(min_length=1, max_length=200_000)
+
+
+class GroupingMemberInput(BaseModel):
+    student_id: str
+    group_number: Optional[int] = Field(default=None, ge=1, le=20)
+
+
+class GroupingDraftInput(BaseModel):
+    revision: int = Field(ge=0)
+    members: list[GroupingMemberInput]
+    leaders: dict[str, Optional[str]]
 
 
 class PeriodInput(BaseModel):
@@ -242,6 +266,45 @@ def import_students(project_id: str, payload: CsvImportInput, request: Request):
     return {"imported": len(ids)}
 
 
+def _roster_preview(project_id: str, text: str, store: Store) -> dict[str, object]:
+    parsed = parse_roster_text(text)
+    preview = store.roster_import_preview(project_id, parsed.rows) if parsed.rows else []
+    return {
+        "valid": parsed.valid and bool(parsed.rows),
+        "count": len(parsed.rows),
+        "recognized_49": len(parsed.rows) == 49,
+        "rows": preview,
+        "errors": parsed.errors,
+        "warnings": parsed.warnings,
+        "summary": {
+            "new": sum(row["status"] == "new" for row in preview),
+            "unchanged": sum(row["status"] == "unchanged" for row in preview),
+            "name_differences": sum(row["status"] == "name_difference" for row in preview),
+        },
+    }
+
+
+@app.post("/api/projects/{project_id}/roster/preview")
+def preview_roster_text(project_id: str, payload: RosterTextInput, request: Request):
+    try:
+        return _roster_preview(project_id, payload.text, _store(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/roster/import", status_code=201)
+def import_roster_text(project_id: str, payload: RosterTextInput, request: Request):
+    store = _store(request)
+    try:
+        preview = _roster_preview(project_id, payload.text, store)
+        if not preview["valid"]:
+            raise ValueError("名单存在错误，请先按行修正")
+        result = store.import_roster_students(project_id, preview["rows"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {**result, "count": preview["count"], "name_differences_preserved": result["name_differences"]}
+
+
 @app.post("/api/projects/{project_id}/students/preview")
 def preview_students(project_id: str, payload: CsvImportInput, request: Request):
     try:
@@ -258,11 +321,28 @@ def preview_students(project_id: str, payload: CsvImportInput, request: Request)
             if not 1 <= group <= project["group_count"]:
                 raise ValueError(f"第 {index + 1} 行组号超出 1—{project['group_count']}")
             seen.add(number)
-        if len(rows) > 49:
-            raise ValueError("当前 A4 模板最多容纳 49 名学生")
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"count": len(rows), "rows": rows}
+
+
+@app.get("/api/periods/{period_id}/grouping")
+def get_grouping(period_id: str, request: Request):
+    try:
+        return _store(request).grouping_draft(period_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/periods/{period_id}/grouping")
+def save_grouping(period_id: str, payload: GroupingDraftInput, request: Request):
+    try:
+        revision = _store(request).save_grouping_draft(
+            period_id, payload.revision, [member.model_dump() for member in payload.members], payload.leaders
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status": "saved", "revision": revision}
 
 
 @app.get("/api/projects/{project_id}/periods")

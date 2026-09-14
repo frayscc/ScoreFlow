@@ -82,6 +82,9 @@ def _prune_snapshot(path: Path, project_id: str) -> None:
             ("DELETE FROM period_groups WHERE period_id NOT IN (SELECT id FROM periods WHERE project_id=?)", (project_id,)),
             ("DELETE FROM period_students WHERE period_id NOT IN (SELECT id FROM periods WHERE project_id=?)", (project_id,)),
             ("DELETE FROM period_rules WHERE period_id NOT IN (SELECT id FROM periods WHERE project_id=?)", (project_id,)),
+            ("DELETE FROM period_draft_groups WHERE period_id NOT IN (SELECT id FROM periods WHERE project_id=?)", (project_id,)),
+            ("DELETE FROM period_draft_members WHERE period_id NOT IN (SELECT id FROM periods WHERE project_id=?)", (project_id,)),
+            ("DELETE FROM period_grouping_revisions WHERE period_id NOT IN (SELECT id FROM periods WHERE project_id=?)", (project_id,)),
             ("DELETE FROM periods WHERE project_id<>?", (project_id,)),
             ("DELETE FROM class_groups WHERE project_id<>?", (project_id,)),
             ("DELETE FROM students WHERE project_id<>?", (project_id,)),
@@ -290,7 +293,8 @@ def _validate_database(database: Path, manifest: dict) -> None:
 
 
 TABLE_ORDER = [
-    "projects", "students", "class_groups", "rules", "periods", "period_students", "period_groups",
+    "projects", "students", "class_groups", "rules", "periods", "period_grouping_revisions",
+    "period_draft_members", "period_draft_groups", "period_students", "period_groups",
     "period_rules", "template_versions", "paper_sheets", "paper_sides", "scan_jobs", "scan_assets",
     "recognition_runs", "slot_observations", "scan_notes", "posting_batches", "ledger_entries", "report_exports",
 ]

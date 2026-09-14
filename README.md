@@ -4,9 +4,19 @@
 
 ScoreFlow 是完全本地运行的班级积分纸表与 OMR 工具。开发计划 Phase 0—5 已完成：班级与名单、周期快照、参数化双面纸表、批量扫描导入、页面身份匹配、四态识别、教师复核、可靠入账、周期关闭、报告，以及完整项目包导出/恢复。
 
+公开源码仓库：[github.com/frayscc/ScoreFlow](https://github.com/frayscc/ScoreFlow)。当前 V2 正在增量开发，可下载的 Windows/Mac 发布包将在后续发布阶段提供。
+
+## V2 名单与周期分组
+
+名单首选入口已改为直接粘贴“学号＋姓名”，可混用空格、逗号、顿号、“号”字和 Excel Tab。确认后在周期草稿中拖拽或批量分组、指定组长并保存进度；已开始周期的分组为只读历史快照。下图使用 49 名纯虚构学生。
+
+![粘贴名单实时预览](docs/images/v2-roster-paste.png)
+
+![周期分组工作台](docs/images/v2-grouping-workbench.png)
+
 ## 直接运行（macOS Apple Silicon）
 
-本机已构建并冒烟验证：双击 `dist/ScoreFlow.app`。也可把 `dist/ScoreFlow-macOS-arm64.zip` 复制到另一台 Apple Silicon Mac 后解压运行。该测试包是 ad-hoc 签名，尚未使用 Apple Developer ID 签名或公证；首次从网络取得时，macOS 可能要求在“隐私与安全性”中明确确认打开。不要关闭系统整体安全保护。
+开发机本地已构建并冒烟验证（成品不随源码仓库提交）：双击 `dist/ScoreFlow.app`。也可把 `dist/ScoreFlow-macOS-arm64.zip` 复制到另一台 Apple Silicon Mac 后解压运行。该测试包是 ad-hoc 签名，尚未使用 Apple Developer ID 签名或公证；首次从网络取得时，macOS 可能要求在“隐私与安全性”中明确确认打开。不要关闭系统整体安全保护。
 
 最终用户不需要安装 Python 或 Node.js。应用数据保存在 `~/Library/Application Support/ScoreFlow/`，替换应用不会覆盖数据。软件内的“退出 ScoreFlow”会安全停止任务和服务；关闭浏览器标签不会退出后台。
 

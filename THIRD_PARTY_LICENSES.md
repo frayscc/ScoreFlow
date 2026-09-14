@@ -21,5 +21,6 @@
 | python-multipart | 0.0.20 | Apache-2.0 |
 | Pillow | 11.3.0 | MIT-CMU |
 | PyInstaller | 6.16.0 | GPL-2.0-or-later with bootloader exception |
+| Playwright（仅开发/截图验证） | 1.63.0 | Apache-2.0 |
 
 实际许可证全文以各锁定发行包随附的 `LICENSE`、`COPYING`、包元数据及 pypdfium2/PDFium 第三方声明为准。本表用于记录本次构建采用的版本和许可标识，不替代原文。
