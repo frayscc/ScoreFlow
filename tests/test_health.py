@@ -106,9 +106,14 @@ def test_full_phase2_flow_generates_downloadable_real_roster_pdf(tmp_path, monke
         assert len(imports) == 1 and len(imports[0]["pages"]) == 2
         detail = client.get(f"/api/recognition-runs/{runs[0]['id']}").json()
         assert detail["effective_counts"]["review"] == 0
+        first_slot = detail["observations"][0]["slot_id"]
+        assert client.put(f"/api/recognition-runs/{runs[0]['id']}/review", json={"decisions":{first_slot:"x"}}, headers=headers).status_code == 200
         assert client.post(f"/api/recognition-runs/{runs[0]['id']}/notes", json={"note_text":"纸面备注核对完成"}, headers=headers).status_code == 201
         assert client.get(f"/api/recognition-runs/{runs[0]['id']}/notes-image").headers["content-type"] == "image/jpeg"
         corrected = client.get(f"/api/recognition-runs/{runs[0]['id']}/corrected")
+        overlay = client.get(f"/api/recognition-runs/{runs[0]['id']}/overlay")
+        assert overlay.status_code == 200 and overlay.headers["content-type"] == "image/png"
+        assert overlay.content != corrected.content
         assert corrected.status_code == 200
         assert corrected.headers["content-type"] == "image/png"
         for run in runs:

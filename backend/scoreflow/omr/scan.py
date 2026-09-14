@@ -98,7 +98,12 @@ def pages_from_file(path: Path):
         for index in range(len(document)):
             page_width, page_height = document[index].get_size()
             if page_width * page_height * (300 / 72) ** 2 > MAX_PAGE_PIXELS: raise ValueError("PDF页面尺寸异常")
-            yield index, cv2.cvtColor(np.asarray(document[index].render(scale=300 / 72).to_pil().convert("RGB")), cv2.COLOR_RGB2BGR)
+            # Electronic-ink apps usually store pen strokes as PDF annotations.
+            # Keep annotations enabled explicitly so PDFium behavior cannot change
+            # silently across dependency upgrades.
+            yield index, cv2.cvtColor(np.asarray(document[index].render(
+                scale=300 / 72, draw_annots=True, optimize_mode="print"
+            ).to_pil().convert("RGB")), cv2.COLOR_RGB2BGR)
     else:
         with Image.open(path) as source:
             if source.width * source.height > MAX_PAGE_PIXELS: raise ValueError("图片像素尺寸超过限制")

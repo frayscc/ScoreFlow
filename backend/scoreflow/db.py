@@ -7,13 +7,14 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager, nullcontext
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from .scoring import aggregate_observations, summarize_results
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 MIGRATION_1 = """
 PRAGMA foreign_keys = ON;
@@ -23,6 +24,7 @@ INSERT INTO schema_version(version) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM sch
 CREATE TABLE projects(
   id TEXT PRIMARY KEY, class_name TEXT NOT NULL, school_year TEXT NOT NULL,
   group_count INTEGER NOT NULL DEFAULT 7 CHECK(group_count BETWEEN 1 AND 20),
+  is_demo INTEGER NOT NULL DEFAULT 0 CHECK(is_demo IN (0,1)), archived_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE students(
@@ -148,7 +150,7 @@ CREATE TABLE report_exports(
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(period_id,result_version,variant,is_draft,source_digest)
 );
-UPDATE schema_version SET version=10;
+UPDATE schema_version SET version=11;
 """
 
 MIGRATION_2 = """
@@ -306,6 +308,13 @@ UPDATE schema_version SET version=10;
 PRAGMA user_version=10;
 """
 
+MIGRATION_11 = """
+ALTER TABLE projects ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0 CHECK(is_demo IN (0,1));
+ALTER TABLE projects ADD COLUMN archived_at TEXT;
+UPDATE schema_version SET version=11;
+PRAGMA user_version=11;
+"""
+
 
 class Store:
     def __init__(self, path: Path):
@@ -373,6 +382,9 @@ class Store:
                 current = 9
             if current == 9:
                 self.connection.executescript(MIGRATION_10)
+                current = 10
+            if current == 10:
+                self.connection.executescript(MIGRATION_11)
             elif current > SCHEMA_VERSION:
                 raise RuntimeError(f"数据库版本 {current} 高于程序支持版本 {SCHEMA_VERSION}")
 
@@ -394,9 +406,64 @@ class Store:
     def list_projects(self) -> list[dict[str, object]]:
         with self._lock:
             rows = self.connection.execute(
-                "SELECT p.*,count(s.id) AS student_count FROM projects p LEFT JOIN students s ON s.project_id=p.id GROUP BY p.id ORDER BY p.created_at DESC"
+                "SELECT p.*,count(s.id) AS student_count FROM projects p LEFT JOIN students s ON s.project_id=p.id "
+                "WHERE p.archived_at IS NULL GROUP BY p.id ORDER BY p.created_at DESC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def reset_demo_project(self) -> dict[str, object]:
+        """Archive previous demos and create a fresh, isolated 49-student demo."""
+        project_id = str(uuid.uuid4())
+        period_id = str(uuid.uuid4())
+        today = date.today()
+        students = []
+        with self._lock, self.connection:
+            old_ids = [row[0] for row in self.connection.execute(
+                "SELECT id FROM projects WHERE is_demo=1 AND archived_at IS NULL"
+            ).fetchall()]
+            self.connection.execute(
+                "UPDATE projects SET archived_at=CURRENT_TIMESTAMP WHERE is_demo=1 AND archived_at IS NULL"
+            )
+            self.connection.execute(
+                "INSERT INTO projects(id,class_name,school_year,group_count,is_demo) VALUES(?,?,?,?,1)",
+                (project_id, "49人演示班", str(today.year), 7),
+            )
+            self.connection.executemany(
+                "INSERT INTO class_groups(project_id,group_number) VALUES(?,?)",
+                [(project_id, group) for group in range(1, 8)],
+            )
+            self._insert_default_rules(project_id, self.connection)
+            for index in range(49):
+                student_id = str(uuid.uuid4())
+                group = index // 7 + 1
+                students.append((student_id, project_id, str(index + 1), f"演示学生{index + 1:02d}", group, index))
+            self.connection.executemany(
+                "INSERT INTO students(id,project_id,student_number,name,group_number,sort_order) VALUES(?,?,?,?,?,?)",
+                students,
+            )
+            for group in range(1, 8):
+                self.connection.execute(
+                    "UPDATE class_groups SET leader_student_id=? WHERE project_id=? AND group_number=?",
+                    (students[(group - 1) * 7][0], project_id, group),
+                )
+            self.connection.execute(
+                "INSERT INTO periods(id,project_id,name,start_date,expected_end_date) VALUES(?,?,?,?,?)",
+                (period_id, project_id, "演示第1周", today.isoformat(), (today + timedelta(days=6)).isoformat()),
+            )
+            self.connection.execute("INSERT INTO period_grouping_revisions(period_id) VALUES(?)", (period_id,))
+            self.connection.executemany(
+                "INSERT INTO period_draft_members(period_id,student_id,group_number,sort_order) VALUES(?,?,?,?)",
+                [(period_id, student[0], student[4], student[5]) for student in students],
+            )
+            self.connection.executemany(
+                "INSERT INTO period_draft_groups(period_id,group_number,leader_student_id) VALUES(?,?,?)",
+                [(period_id, group, students[(group - 1) * 7][0]) for group in range(1, 8)],
+            )
+            self.connection.execute(
+                "INSERT INTO audit_events(action,entity_id,details_json) VALUES('demo_reset',?,?)",
+                (project_id, json.dumps({"archived_project_ids": old_ids}, ensure_ascii=False)),
+            )
+        return {"project_id": project_id, "period_id": period_id, "archived_project_ids": old_ids}
 
     def list_students(self, project_id: str) -> list[dict[str, object]]:
         with self._lock:

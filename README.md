@@ -36,6 +36,8 @@ Windows x64 的同源构建脚本为 `scripts/build_windows.ps1`，但当前 Mac
 
 “导入记录”按文件和 PDF 页管理扫描，可筛选状态、重新识别、取消确认、删除单页或批量移除。未入账测试记录删除后可重导同一文件；已入账记录必须撤销整表入账，系统会保留审计证据。删除扫描永远不会删除已签发的纸表。
 
+“预览/复核”展示识别引擎实际处理的校正栅格图，并可切换带形状和文字的叠加层。电子笔记软件导出的 PDF 批注层与普通页面内容都会参与识别；全空白结果必须由教师明确确认。界面还可创建或重置隔离的 49 人演示项目，正式班级不会出现一键清空入口。详见 [Notability / 电子笔迹工作流](docs/notability-workflow.md)。
+
 界面中的“完整备份与跨电脑恢复”可直接生成 `.scorepack`。它是未加密 ZIP，包含一致性 SQLite 快照、纸表和版式 manifest、原始扫描、校正证据及报告；恢复前会校验路径、体积、版本、SHA-256、SQLite 完整性和引用文件。恢复始终建立独立项目，遇到同一项目身份会拒绝覆盖。
 
 ## 开发运行
@@ -82,7 +84,7 @@ npm --prefix frontend run build
 Phase 3 的实现与验收范围见 [Phase 3 验证报告](docs/phase3-test-report.md)。
 Phase 4 的实现与验收范围见 [Phase 4 验证报告](docs/phase4-test-report.md)。
 Phase 5 的实现、便携包状态与验收范围见 [Phase 5 验证报告](docs/phase5-test-report.md)。
-V2 名单与分组见 [V2-1 验证报告](docs/v2-1-test-report.md)，扫描导入记录管理见 [V2-2 验证报告](docs/v2-2-test-report.md)。
+V2 名单与分组见 [V2-1 验证报告](docs/v2-1-test-report.md)，扫描导入记录管理见 [V2-2 验证报告](docs/v2-2-test-report.md)，真实预览、演示重置与 PDF 批注见 [V2-3 验证报告](docs/v2-3-test-report.md)。
 
 ## 开源许可
 

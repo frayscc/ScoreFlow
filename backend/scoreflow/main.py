@@ -216,6 +216,12 @@ def create_project(payload: ProjectInput, request: Request):
     return {"id": project_id, **payload.model_dump()}
 
 
+@app.post("/api/demo/reset", status_code=201)
+def reset_demo_project(request: Request):
+    """Create a fresh demo identity; previous demos are retained but hidden."""
+    return _store(request).reset_demo_project()
+
+
 @app.post("/api/projects/{project_id}/scorepack", status_code=201)
 def create_scorepack(project_id: str, request: Request):
     try:
@@ -745,6 +751,53 @@ def corrected_scan(run_id: str, request: Request):
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="校正图尚未生成")
     return FileResponse(path, media_type="image/png", filename=f"校正页-{run_id[:8]}.png")
+
+
+@app.get("/api/recognition-runs/{run_id}/overlay")
+def recognition_overlay(run_id: str, request: Request):
+    """Return the engine's corrected raster with accessible result overlays."""
+    try:
+        run = _store(request).get_run(run_id, include_observations=True)
+        if not run.get("corrected_path") or not run.get("sheet_id") or not run.get("side"):
+            raise ValueError("校正图尚未生成")
+        info = _store(request).paper_download_info(run["sheet_id"])
+        manifest_path = data_dir() / "projects" / info["project_id"] / "papers" / f"paper-{info['sheet_number']:02d}-{run['sheet_id']}.manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        slots = {slot["slot_id"]: slot for slot in manifest["sides"][run["side"]]["slots"]}
+        image = cv2.imread(run["corrected_path"])
+        if image is None:
+            raise ValueError("校正图无法读取")
+        height, width = image.shape[:2]; page = manifest["page"]
+        styles = {
+            "slash_forward": ((40, 150, 45), "circle", "/"),
+            "slash_back": ((40, 150, 45), "circle", "\\"),
+            "x": ((200, 80, 25), "square", "X"),
+            "review": ((20, 125, 230), "diamond", "?"),
+        }
+        for observation in run["observations"]:
+            value = observation["manual_class"] or observation["auto_class"]
+            if value not in styles or observation["slot_id"] not in slots:
+                continue
+            roi = slots[observation["slot_id"]]["roi"]
+            cx = round((roi["x_mm"] + roi["width_mm"] / 2) / page["width_mm"] * width)
+            cy = round((page["height_mm"] - roi["y_mm"] - roi["height_mm"] / 2) / page["height_mm"] * height)
+            size = max(14, round(roi["height_mm"] / page["height_mm"] * height * 1.15))
+            color, shape, label = styles[value]
+            thickness = max(3, size // 10); radius = size // 2
+            if shape == "circle":
+                cv2.circle(image, (cx, cy), radius, color, thickness)
+            elif shape == "square":
+                cv2.rectangle(image, (cx-radius,cy-radius), (cx+radius,cy+radius), color, thickness)
+            else:
+                cv2.drawMarker(image, (cx, cy), color, cv2.MARKER_DIAMOND, size, thickness)
+            cv2.putText(image, label, (cx + size // 2, cy - size // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        max(.45, size / 42), color, max(2, size // 12), cv2.LINE_AA)
+        ok, encoded = cv2.imencode(".png", image)
+        if not ok:
+            raise ValueError("叠加图编码失败")
+        return Response(encoded.tobytes(), media_type="image/png")
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/recognition-runs/{run_id}/notes-image")

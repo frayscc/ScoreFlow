@@ -16,6 +16,7 @@
 | ReportLab | 4.4.9 | BSD |
 | qrcode | 8.2 | BSD |
 | pypdfium2 / PDFium | 4.30.0 | Apache-2.0 OR BSD-3-Clause；PDFium 另含其第三方许可 |
+| pypdf | 6.10.0 | BSD-3-Clause |
 | NumPy | 2.0.2（Python 3.9） | BSD-3-Clause；二进制发行物含其声明的兼容依赖 |
 | OpenCV headless | 4.12.0.88 | Apache-2.0 |
 | python-multipart | 0.0.20 | Apache-2.0 |

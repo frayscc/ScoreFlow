@@ -117,17 +117,43 @@ def test_schema_v6_upgrades_to_phase4_ledger_tables(tmp_path):
         store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN is_duplicate")
         store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN original_filename")
         store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN sha256")
+        store.connection.execute("ALTER TABLE projects DROP COLUMN is_demo")
+        store.connection.execute("ALTER TABLE projects DROP COLUMN archived_at")
         store.connection.execute("UPDATE schema_version SET version=6")
         store.connection.execute("PRAGMA user_version=6")
     store.close()
     upgraded = Store(path)
-    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 11
     tables = {row[0] for row in upgraded.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"posting_batches", "ledger_entries", "report_exports"}.issubset(tables)
     columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(posting_batches)")}
     assert {"front_run_id", "back_run_id"}.issubset(columns)
     run_columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(recognition_runs)")}
     assert {"removed_at", "removal_reason"}.issubset(run_columns)
+    project_columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(projects)")}
+    assert {"is_demo", "archived_at"}.issubset(project_columns)
     job_columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(scan_jobs)")}
     assert {"scan_asset_id", "is_duplicate", "original_filename", "sha256"}.issubset(job_columns)
     assert upgraded.connection.execute("SELECT count(*) FROM period_grouping_revisions").fetchone()[0] == 0
+
+
+def test_demo_reset_is_isolated_and_preserves_formal_projects(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    formal = store.create_project("正式班", "2026")
+    first = store.reset_demo_project()
+    assert len(store.list_students(first["project_id"])) == 49
+    draft = store.grouping_draft(first["period_id"])
+    assert len(draft["members"]) == 49
+    assert len(draft["leaders"]) == 7
+    assert all(draft["leaders"].values())
+    old_sheet = store.start_period(first["period_id"])
+    second = store.reset_demo_project()
+    assert second["project_id"] != first["project_id"]
+    visible = store.list_projects()
+    assert {item["id"] for item in visible} == {formal, second["project_id"]}
+    assert next(item for item in visible if item["id"] == formal)["is_demo"] == 0
+    assert next(item for item in visible if item["id"] == second["project_id"])["is_demo"] == 1
+    archived = store.connection.execute("SELECT archived_at FROM projects WHERE id=?", (first["project_id"],)).fetchone()[0]
+    assert archived is not None
+    with pytest.raises(ValueError, match="不存在"):
+        store.resolve_sheet_reference(second["project_id"], old_sheet[-8:])
