@@ -6,14 +6,14 @@ import json
 import sqlite3
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from .scoring import aggregate_observations, summarize_results
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 MIGRATION_1 = """
 PRAGMA foreign_keys = ON;
@@ -94,19 +94,23 @@ CREATE TABLE template_versions(
 CREATE TABLE scan_jobs(
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), status TEXT NOT NULL,
   stage TEXT NOT NULL, total_pages INTEGER NOT NULL DEFAULT 0, completed_pages INTEGER NOT NULL DEFAULT 0,
-  cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  scan_asset_id TEXT, is_duplicate INTEGER NOT NULL DEFAULT 0 CHECK(is_duplicate IN (0,1)),
+  original_filename TEXT, sha256 TEXT
 );
 CREATE TABLE scan_assets(
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), original_filename TEXT NOT NULL,
   job_id TEXT REFERENCES scan_jobs(id), stored_path TEXT NOT NULL, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(project_id,sha256)
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, delete_requested INTEGER NOT NULL DEFAULT 0 CHECK(delete_requested IN (0,1)),
+  UNIQUE(project_id,sha256)
 );
 CREATE TABLE recognition_runs(
   id TEXT PRIMARY KEY, scan_asset_id TEXT NOT NULL REFERENCES scan_assets(id), page_index INTEGER NOT NULL,
   sheet_id TEXT REFERENCES paper_sheets(id), side TEXT CHECK(side IN ('front','back')), corrected_path TEXT,
   algorithm_version TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','processing','needs_identity','failed','ready','reviewed')),
   adopted INTEGER NOT NULL DEFAULT 0 CHECK(adopted IN (0,1)), quality_json TEXT, error TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(scan_asset_id,page_index)
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, removed_at TEXT, removal_reason TEXT,
+  UNIQUE(scan_asset_id,page_index)
 );
 CREATE TABLE slot_observations(
   run_id TEXT NOT NULL REFERENCES recognition_runs(id), slot_id TEXT NOT NULL, auto_class TEXT NOT NULL,
@@ -144,7 +148,7 @@ CREATE TABLE report_exports(
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(period_id,result_version,variant,is_draft,source_digest)
 );
-UPDATE schema_version SET version=9;
+UPDATE schema_version SET version=10;
 """
 
 MIGRATION_2 = """
@@ -287,6 +291,21 @@ UPDATE schema_version SET version=9;
 PRAGMA user_version=9;
 """
 
+MIGRATION_10 = """
+ALTER TABLE scan_assets ADD COLUMN delete_requested INTEGER NOT NULL DEFAULT 0 CHECK(delete_requested IN (0,1));
+ALTER TABLE recognition_runs ADD COLUMN removed_at TEXT;
+ALTER TABLE recognition_runs ADD COLUMN removal_reason TEXT;
+ALTER TABLE scan_jobs ADD COLUMN scan_asset_id TEXT;
+ALTER TABLE scan_jobs ADD COLUMN is_duplicate INTEGER NOT NULL DEFAULT 0 CHECK(is_duplicate IN (0,1));
+ALTER TABLE scan_jobs ADD COLUMN original_filename TEXT;
+ALTER TABLE scan_jobs ADD COLUMN sha256 TEXT;
+UPDATE scan_jobs SET scan_asset_id=(SELECT id FROM scan_assets WHERE scan_assets.job_id=scan_jobs.id);
+UPDATE scan_jobs SET original_filename=(SELECT original_filename FROM scan_assets WHERE scan_assets.job_id=scan_jobs.id),
+  sha256=(SELECT sha256 FROM scan_assets WHERE scan_assets.job_id=scan_jobs.id);
+UPDATE schema_version SET version=10;
+PRAGMA user_version=10;
+"""
+
 
 class Store:
     def __init__(self, path: Path):
@@ -351,6 +370,9 @@ class Store:
                 current = 8
             if current == 8:
                 self.connection.executescript(MIGRATION_9)
+                current = 9
+            if current == 9:
+                self.connection.executescript(MIGRATION_10)
             elif current > SCHEMA_VERSION:
                 raise RuntimeError(f"数据库版本 {current} 高于程序支持版本 {SCHEMA_VERSION}")
 
@@ -728,10 +750,11 @@ class Store:
             self.connection.execute("INSERT OR IGNORE INTO template_versions(id,template_name,geometry_json,font_sha256) VALUES(?,?,?,?)", (version_id, manifest["template_id"], geometry, font_sha256))
             self.connection.execute("UPDATE paper_sheets SET template_id=? WHERE id=?", (version_id, sheet_id))
 
-    def create_scan_job(self, project_id: str) -> str:
+    def create_scan_job(self, project_id: str, filename: Optional[str] = None) -> str:
         job_id = str(uuid.uuid4())
         with self._lock, self.connection:
-            self.connection.execute("INSERT INTO scan_jobs(id,project_id,status,stage) VALUES(?,?,'queued','等待处理')", (job_id, project_id))
+            self.connection.execute("INSERT INTO scan_jobs(id,project_id,status,stage,original_filename) VALUES(?,?,'queued','等待处理',?)",
+                                    (job_id, project_id, filename))
         return job_id
 
     def recover_interrupted_jobs(self) -> None:
@@ -762,13 +785,37 @@ class Store:
             if not changed:
                 raise ValueError("任务已结束，无法取消")
 
+    def remove_scan_job_record(self, job_id: str) -> None:
+        with self._lock, self.connection:
+            row = self.connection.execute("SELECT status,scan_asset_id,is_duplicate FROM scan_jobs WHERE id=?", (job_id,)).fetchone()
+            if not row:
+                raise ValueError("导入记录不存在")
+            if row["status"] in {"queued", "processing"}:
+                raise ValueError("请先取消正在运行的任务")
+            if row["scan_asset_id"] and not row["is_duplicate"]:
+                raise ValueError("该记录仍有导入文件，请使用删除本次导入")
+            self.connection.execute("DELETE FROM scan_jobs WHERE id=?", (job_id,))
+
+    def scan_asset_delete_requested(self, asset_id: str) -> bool:
+        with self._lock:
+            row = self.connection.execute("SELECT delete_requested FROM scan_assets WHERE id=?", (asset_id,)).fetchone()
+            return not row or bool(row["delete_requested"])
+
     def create_scan_asset(self, project_id: str, filename: str, stored_path: str, sha256: str, size_bytes: int, job_id: Optional[str] = None) -> tuple[str, bool]:
         with self._lock, self.connection:
-            existing = self.connection.execute("SELECT id FROM scan_assets WHERE project_id=? AND sha256=?", (project_id, sha256)).fetchone()
+            existing = self.connection.execute("SELECT id,delete_requested FROM scan_assets WHERE project_id=? AND sha256=?", (project_id, sha256)).fetchone()
             if existing:
+                if existing["delete_requested"]:
+                    raise ValueError("相同文件正在删除，请稍后重试")
+                if job_id:
+                    self.connection.execute("UPDATE scan_jobs SET scan_asset_id=?,is_duplicate=1,original_filename=?,sha256=? WHERE id=?",
+                                            (existing["id"], filename, sha256, job_id))
                 return existing["id"], True
             asset_id = str(uuid.uuid4())
             self.connection.execute("INSERT INTO scan_assets(id,project_id,original_filename,job_id,stored_path,sha256,size_bytes) VALUES(?,?,?,?,?,?,?)", (asset_id, project_id, filename, job_id, stored_path, sha256, size_bytes))
+            if job_id:
+                self.connection.execute("UPDATE scan_jobs SET scan_asset_id=?,original_filename=?,sha256=? WHERE id=?",
+                                        (asset_id, filename, sha256, job_id))
             return asset_id, False
 
     def create_recognition_run(self, asset_id: str, page_index: int) -> str:
@@ -803,9 +850,242 @@ class Store:
         with self._lock:
             rows = self.connection.execute(
                 "SELECT rr.*,sa.original_filename,sa.sha256 FROM recognition_runs rr JOIN scan_assets sa ON sa.id=rr.scan_asset_id "
-                "WHERE sa.project_id=? ORDER BY rr.created_at DESC,rr.page_index", (project_id,)
+                "WHERE sa.project_id=? AND rr.removed_at IS NULL AND sa.delete_requested=0 "
+                "ORDER BY rr.created_at DESC,rr.page_index", (project_id,)
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_scan_imports(self, project_id: str, include_removed: bool = False) -> list[dict[str, object]]:
+        with self._lock:
+            assets = [dict(row) for row in self.connection.execute(
+                "SELECT COALESCE(sa.id,sj.id) id,sa.id asset_id,sj.project_id,sa.job_id,sa.stored_path,sa.size_bytes,COALESCE(sa.delete_requested,0) delete_requested,"
+                "COALESCE(sj.original_filename,sa.original_filename) original_filename,"
+                "COALESCE(sj.sha256,sa.sha256) sha256,sj.id import_job_id,sj.status job_status,sj.stage,sj.total_pages,sj.completed_pages,"
+                "sj.error job_error,sj.is_duplicate,sj.created_at import_created_at "
+                "FROM scan_jobs sj LEFT JOIN scan_assets sa ON sa.id=sj.scan_asset_id WHERE sj.project_id=? "
+                "ORDER BY sj.created_at DESC,sj.id", (project_id,)
+            )]
+            result = []
+            for asset in assets:
+                clauses = "" if include_removed else " AND rr.removed_at IS NULL"
+                pages = [] if asset["is_duplicate"] or not asset["asset_id"] else [dict(row) for row in self.connection.execute(
+                    "SELECT rr.*,ps.sheet_number,p.name period_name,p.status period_status,"
+                    "EXISTS(SELECT 1 FROM posting_batches pb WHERE (pb.front_run_id=rr.id OR pb.back_run_id=rr.id) "
+                    "AND pb.status='posted' AND pb.reverses_batch_id IS NULL) is_posted,"
+                    "(SELECT COUNT(*) FROM slot_observations so WHERE so.run_id=rr.id "
+                    "AND COALESCE(so.manual_class,so.auto_class) LIKE 'slash_%') effective_marks "
+                    "FROM recognition_runs rr LEFT JOIN paper_sheets ps ON ps.id=rr.sheet_id "
+                    "LEFT JOIN periods p ON p.id=ps.period_id WHERE rr.scan_asset_id=?" + clauses +
+                    " ORDER BY rr.page_index,rr.created_at", (asset["asset_id"],)
+                )]
+                for page in pages:
+                    quality = json.loads(page["quality_json"]) if page.get("quality_json") else {}
+                    page["quality"] = quality
+                    page["predicted_delta"] = quality.get("predicted_delta", 0)
+                    page.pop("quality_json", None)
+                if pages or asset["is_duplicate"] or asset["job_status"] in {"queued", "processing", "failed"} or (asset["job_status"] == "cancelled" and asset["asset_id"]):
+                    asset["created_at"] = asset["import_created_at"]
+                    asset["pages"] = pages
+                    result.append(asset)
+            return result
+
+    def scan_removal_preview(self, run_ids: list[str]) -> dict[str, object]:
+        unique = list(dict.fromkeys(run_ids))
+        if not unique:
+            raise ValueError("请选择要移除的页面")
+        placeholders = ",".join("?" for _ in unique)
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT rr.id,rr.sheet_id,rr.side,rr.adopted,p.status period_status,ps.sheet_number,"
+                f"EXISTS(SELECT 1 FROM posting_batches pb WHERE (pb.front_run_id=rr.id OR pb.back_run_id=rr.id) "
+                f"AND pb.status='posted' AND pb.reverses_batch_id IS NULL) is_posted "
+                f"FROM recognition_runs rr LEFT JOIN paper_sheets ps ON ps.id=rr.sheet_id "
+                f"LEFT JOIN periods p ON p.id=ps.period_id WHERE rr.id IN ({placeholders}) AND rr.removed_at IS NULL",
+                unique,
+            ).fetchall()
+            if len(rows) != len(unique):
+                raise ValueError("部分识别页不存在或已移除")
+            if any(row["period_status"] == "closed" for row in rows):
+                raise ValueError("已关闭周期为只读；请先通过维护入口重新打开")
+            posted_sheets = {row["sheet_id"] for row in rows if row["is_posted"]}
+            affected_people = 0
+            score_delta = 0
+            for sheet_id in posted_sheets:
+                batch = self.connection.execute(
+                    "SELECT id FROM posting_batches WHERE sheet_id=? AND status='posted' AND reverses_batch_id IS NULL", (sheet_id,)
+                ).fetchone()
+                if batch:
+                    summary = self.connection.execute(
+                        "SELECT COUNT(DISTINCT student_id),COALESCE(SUM(amount),0) FROM ledger_entries WHERE batch_id=?", (batch["id"],)
+                    ).fetchone()
+                    affected_people += int(summary[0]); score_delta += int(summary[1])
+            return {"page_count":len(rows), "requires_reversal":len(posted_sheets),
+                    "affected_people":affected_people, "score_delta":score_delta}
+
+    def cancel_run_adoption(self, run_id: str) -> None:
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT rr.*,p.status period_status FROM recognition_runs rr LEFT JOIN paper_sheets ps ON ps.id=rr.sheet_id "
+                "LEFT JOIN periods p ON p.id=ps.period_id WHERE rr.id=? AND rr.removed_at IS NULL", (run_id,)
+            ).fetchone()
+            if not row or not row["adopted"]:
+                raise ValueError("该页面没有已采用的确认")
+            if row["period_status"] == "closed":
+                raise ValueError("已关闭周期为只读；请先通过维护入口重新打开")
+            posted = self.connection.execute(
+                "SELECT 1 FROM posting_batches WHERE (front_run_id=? OR back_run_id=?) AND status='posted' AND reverses_batch_id IS NULL",
+                (run_id, run_id),
+            ).fetchone()
+            if posted:
+                raise ValueError("该页面已入账，必须先撤销整表入账")
+            self.connection.execute("UPDATE recognition_runs SET adopted=0,status='ready' WHERE id=?", (run_id,))
+            self.connection.execute("UPDATE paper_sides SET status='candidate' WHERE sheet_id=? AND side=?", (row["sheet_id"], row["side"]))
+            self.connection.execute("INSERT INTO audit_events(action,entity_id,details_json) VALUES('cancel_run_adoption',?,'{}')", (run_id,))
+
+    def prepare_recognition_retry(self, run_id: str) -> dict[str, object]:
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT rr.*,sa.job_id,sa.stored_path,sa.delete_requested,p.status period_status "
+                "FROM recognition_runs rr JOIN scan_assets sa ON sa.id=rr.scan_asset_id "
+                "LEFT JOIN paper_sheets ps ON ps.id=rr.sheet_id LEFT JOIN periods p ON p.id=ps.period_id "
+                "WHERE rr.id=? AND rr.removed_at IS NULL", (run_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError("识别页不存在或已移除")
+            if row["delete_requested"]:
+                raise ValueError("该导入正在删除")
+            if row["adopted"]:
+                raise ValueError("请先取消该面确认再重新识别")
+            if row["period_status"] == "closed":
+                raise ValueError("已关闭周期为只读；请先通过维护入口重新打开")
+            if row["status"] in {"queued", "processing"}:
+                raise ValueError("该页面正在识别")
+            self.connection.execute("DELETE FROM slot_observations WHERE run_id=?", (run_id,))
+            self.connection.execute(
+                "UPDATE recognition_runs SET status='queued',adopted=0,quality_json=NULL,error=NULL,corrected_path=NULL WHERE id=?", (run_id,)
+            )
+            self.connection.execute(
+                "UPDATE scan_jobs SET status='queued',stage='等待重新识别',cancel_requested=0,error=NULL WHERE id=?", (row["job_id"],)
+            )
+            self.connection.execute("INSERT INTO audit_events(action,entity_id,details_json) VALUES('retry_recognition_run',?,'{}')", (run_id,))
+            return {"run_id":run_id, "job_id":row["job_id"], "asset_id":row["scan_asset_id"],
+                    "stored_path":row["stored_path"], "page_index":row["page_index"], "old_corrected_path":row["corrected_path"]}
+
+    def remove_recognition_runs(self, run_ids: list[str], reason: str, *, reverse_posted: bool = False,
+                                idempotency_prefix: Optional[str] = None) -> dict[str, object]:
+        if not reason.strip():
+            raise ValueError("移除记录必须填写原因")
+        preview = self.scan_removal_preview(run_ids)
+        if preview["requires_reversal"] and not reverse_posted:
+            raise ValueError(
+                f"选中页面涉及 {preview['requires_reversal']} 张已入账纸表，"
+                f"必须撤销整表入账（影响 {preview['affected_people']} 人，分值 {preview['score_delta']:+d}）"
+            )
+        unique = list(dict.fromkeys(run_ids))
+        paths: set[str] = set()
+        reversed_sheets: list[str] = []
+        hard_deleted = soft_removed = 0
+        with self._lock, self.connection:
+            rows = [self.connection.execute("SELECT * FROM recognition_runs WHERE id=?", (run_id,)).fetchone() for run_id in unique]
+            posted_sheets = {
+                row["sheet_id"] for row in rows if row and self.connection.execute(
+                    "SELECT 1 FROM posting_batches WHERE (front_run_id=? OR back_run_id=?) "
+                    "AND status='posted' AND reverses_batch_id IS NULL", (row["id"], row["id"])
+                ).fetchone()
+            }
+            for sheet_id in sorted(posted_sheets):
+                key = f"{idempotency_prefix or uuid.uuid4()}:{sheet_id}"
+                self.reverse_posting(sheet_id, reason, key, _in_transaction=True)
+                reversed_sheets.append(sheet_id)
+            for row in rows:
+                if not row:
+                    raise ValueError("识别页不存在")
+                run_id, sheet_id, side = row["id"], row["sheet_id"], row["side"]
+                referenced = self.connection.execute(
+                    "SELECT 1 FROM posting_batches WHERE front_run_id=? OR back_run_id=?", (run_id, run_id)
+                ).fetchone()
+                was_adopted = bool(row["adopted"])
+                if referenced:
+                    self.connection.execute(
+                        "UPDATE recognition_runs SET adopted=0,removed_at=CURRENT_TIMESTAMP,removal_reason=? WHERE id=?",
+                        (reason.strip(), run_id),
+                    )
+                    soft_removed += 1
+                else:
+                    if row["corrected_path"]:
+                        paths.add(row["corrected_path"])
+                    self.connection.execute("DELETE FROM scan_notes WHERE run_id=?", (run_id,))
+                    self.connection.execute("DELETE FROM slot_observations WHERE run_id=?", (run_id,))
+                    self.connection.execute("DELETE FROM recognition_runs WHERE id=?", (run_id,))
+                    hard_deleted += 1
+                if sheet_id and side:
+                    remaining = self.connection.execute(
+                        "SELECT adopted FROM recognition_runs WHERE sheet_id=? AND side=? AND removed_at IS NULL", (sheet_id, side)
+                    ).fetchall()
+                    if was_adopted or not remaining:
+                        self.connection.execute("UPDATE paper_sides SET status='missing' WHERE sheet_id=? AND side=?", (sheet_id, side))
+                    elif not any(item["adopted"] for item in remaining):
+                        self.connection.execute("UPDATE paper_sides SET status='candidate' WHERE sheet_id=? AND side=?", (sheet_id, side))
+                self.connection.execute(
+                    "INSERT INTO audit_events(action,entity_id,details_json) VALUES('remove_recognition_run',?,?)",
+                    (run_id, json.dumps({"reason":reason.strip(), "history_retained":bool(referenced)}, ensure_ascii=False)),
+                )
+            asset_ids = {row["scan_asset_id"] for row in rows if row}
+            for asset_id in asset_ids:
+                if not self.connection.execute("SELECT 1 FROM recognition_runs WHERE scan_asset_id=?", (asset_id,)).fetchone():
+                    asset = self.connection.execute("SELECT stored_path FROM scan_assets WHERE id=?", (asset_id,)).fetchone()
+                    if asset:
+                        paths.add(asset["stored_path"])
+                    self.connection.execute("DELETE FROM scan_assets WHERE id=?", (asset_id,))
+        return {**preview, "hard_deleted":hard_deleted, "history_retained":soft_removed,
+                "reversed_sheets":reversed_sheets, "paths_to_delete":sorted(paths)}
+
+    def request_scan_asset_deletion(self, asset_id: str, reason: str) -> dict[str, object]:
+        if not reason.strip():
+            raise ValueError("删除导入必须填写原因")
+        with self._lock, self.connection:
+            asset = self.connection.execute(
+                "SELECT sa.*,sj.status job_status FROM scan_assets sa LEFT JOIN scan_jobs sj ON sj.id=sa.job_id WHERE sa.id=?", (asset_id,)
+            ).fetchone()
+            if not asset:
+                raise ValueError("导入文件不存在")
+            posted = self.connection.execute(
+                "SELECT 1 FROM recognition_runs rr JOIN posting_batches pb ON pb.front_run_id=rr.id OR pb.back_run_id=rr.id "
+                "WHERE rr.scan_asset_id=? AND pb.status='posted' AND pb.reverses_batch_id IS NULL", (asset_id,)
+            ).fetchone()
+            if posted:
+                raise ValueError("该导入含已入账页面，请选择页面并使用“撤销入账并移除”")
+            if asset["job_status"] in {"queued", "processing"}:
+                self.connection.execute("UPDATE scan_assets SET delete_requested=1 WHERE id=?", (asset_id,))
+                self.connection.execute("UPDATE scan_jobs SET cancel_requested=1,stage='正在取消并删除' WHERE id=?", (asset["job_id"],))
+                self.connection.execute("INSERT INTO audit_events(action,entity_id,details_json) VALUES('request_delete_scan_asset',?,?)",
+                                        (asset_id, json.dumps({"reason":reason.strip()}, ensure_ascii=False)))
+                return {"status":"pending", "paths_to_delete":[]}
+            run_ids = [row[0] for row in self.connection.execute(
+                "SELECT id FROM recognition_runs WHERE scan_asset_id=? AND removed_at IS NULL", (asset_id,)
+            )]
+        if run_ids:
+            return {"status":"deleted", **self.remove_recognition_runs(run_ids, reason)}
+        with self._lock, self.connection:
+            asset = self.connection.execute("SELECT stored_path FROM scan_assets WHERE id=?", (asset_id,)).fetchone()
+            if asset:
+                self.connection.execute("DELETE FROM scan_assets WHERE id=?", (asset_id,))
+        return {"status":"deleted", "paths_to_delete":[asset["stored_path"]] if asset else []}
+
+    def finalize_requested_asset_deletion(self, asset_id: str) -> dict[str, object]:
+        with self._lock:
+            asset = self.connection.execute("SELECT stored_path,delete_requested FROM scan_assets WHERE id=?", (asset_id,)).fetchone()
+            if not asset or not asset["delete_requested"]:
+                return {"paths_to_delete":[]}
+            run_ids = [row[0] for row in self.connection.execute(
+                "SELECT id FROM recognition_runs WHERE scan_asset_id=? AND removed_at IS NULL", (asset_id,)
+            )]
+        if run_ids:
+            result = self.remove_recognition_runs(run_ids, "识别中取消并删除")
+            return result
+        with self._lock, self.connection:
+            self.connection.execute("DELETE FROM scan_assets WHERE id=?", (asset_id,))
+        return {"paths_to_delete":[asset["stored_path"]]}
 
     def get_run(self, run_id: str, include_observations: bool = False) -> dict[str, object]:
         with self._lock:
@@ -994,12 +1274,14 @@ class Store:
             )
             return {"id": batch_id, "sheet_id": sheet_id, "status": "posted", "entry_count": len(entries)}
 
-    def reverse_posting(self, sheet_id: str, reason: str, idempotency_key: str) -> dict[str, object]:
+    def reverse_posting(self, sheet_id: str, reason: str, idempotency_key: str,
+                        _in_transaction: bool = False) -> dict[str, object]:
         if not reason.strip():
             raise ValueError("撤销入账必须填写原因")
         if not idempotency_key.strip():
             raise ValueError("缺少幂等键")
-        with self._lock, self.connection:
+        transaction = nullcontext() if _in_transaction else self.connection
+        with self._lock, transaction:
             existing = self.connection.execute(
                 "SELECT * FROM posting_batches WHERE idempotency_key=?", (idempotency_key,)
             ).fetchone()

@@ -102,6 +102,8 @@ def test_full_phase2_flow_generates_downloadable_real_roster_pdf(tmp_path, monke
         assert job["status"] == "completed"
         runs = client.get(f"/api/projects/{project['id']}/recognition-runs").json()
         assert {run["side"] for run in runs} == {"front","back"}
+        imports = client.get(f"/api/projects/{project['id']}/scan-imports").json()
+        assert len(imports) == 1 and len(imports[0]["pages"]) == 2
         detail = client.get(f"/api/recognition-runs/{runs[0]['id']}").json()
         assert detail["effective_counts"]["review"] == 0
         assert client.post(f"/api/recognition-runs/{runs[0]['id']}/notes", json={"note_text":"纸面备注核对完成"}, headers=headers).status_code == 201
@@ -111,6 +113,8 @@ def test_full_phase2_flow_generates_downloadable_real_roster_pdf(tmp_path, monke
         assert corrected.headers["content-type"] == "image/png"
         for run in runs:
             assert client.post(f"/api/recognition-runs/{run['id']}/adopt", json={}, headers=headers).status_code == 200
+        assert client.delete(f"/api/recognition-runs/{runs[0]['id']}/adoption", headers=headers).json()["status"] == "candidate"
+        assert client.post(f"/api/recognition-runs/{runs[0]['id']}/adopt", json={}, headers=headers).status_code == 200
         duplicate = client.post(f"/api/projects/{project['id']}/scans", files=[("files", ("renamed.pdf", pdf.content, "application/pdf"))], headers=headers)
         assert duplicate.json()["items"][0]["duplicate"] is True
         blank_sheet = client.post(f"/api/periods/{period['id']}/papers", json={}, headers=headers).json()["sheet_id"]
@@ -121,6 +125,8 @@ def test_full_phase2_flow_generates_downloadable_real_roster_pdf(tmp_path, monke
         assert client.post(f"/api/periods/{period['id']}/settle", json={}, headers=headers).json()["status"] == "settling"
         posted = client.post(f"/api/papers/{started.json()['sheet_id']}/post", json={"idempotency_key":"api-post"}, headers=headers)
         assert posted.status_code == 200
+        removal = client.post("/api/scan-records/removal-preview", json={"run_ids":[runs[0]["id"]]}, headers=headers)
+        assert removal.json()["requires_reversal"] == 1
         assert client.post(f"/api/papers/{started.json()['sheet_id']}/post", json={"idempotency_key":"api-post-retry"}, headers=headers).json()["id"] == posted.json()["id"]
         results = client.get(f"/api/periods/{period['id']}/results").json()
         assert len(results["students"]) == 49

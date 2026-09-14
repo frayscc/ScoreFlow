@@ -179,6 +179,13 @@ class ReasonInput(BaseModel):
     idempotency_key: Optional[str] = Field(default=None, max_length=100)
 
 
+class RemoveRunsInput(BaseModel):
+    run_ids: list[str] = Field(min_length=1, max_length=200)
+    reason: str = Field(default="移除测试导入记录", min_length=1, max_length=500)
+    reverse_posted: bool = False
+    idempotency_key: Optional[str] = Field(default=None, max_length=100)
+
+
 class ReportInput(BaseModel):
     variant: Literal["teacher", "display"]
     draft: bool = False
@@ -186,6 +193,15 @@ class ReportInput(BaseModel):
 
 def _store(request: Request) -> Store:
     return request.app.state.store
+
+
+def _delete_managed_files(paths: list[str]) -> None:
+    root = data_dir().resolve()
+    for value in paths:
+        path = Path(value).resolve()
+        if path == root or root not in path.parents:
+            raise RuntimeError("拒绝删除数据目录之外的文件")
+        path.unlink(missing_ok=True)
 
 
 @app.get("/api/projects")
@@ -573,6 +589,68 @@ def cancel_scan_job(job_id: str, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"status": "cancelling"}
+
+
+@app.delete("/api/scan-jobs/{job_id}/record")
+def remove_scan_job_record(job_id: str, request: Request):
+    try:
+        _store(request).remove_scan_job_record(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status":"deleted"}
+
+
+@app.get("/api/projects/{project_id}/scan-imports")
+def scan_import_records(project_id: str, request: Request, include_removed: bool = False):
+    return _store(request).list_scan_imports(project_id, include_removed=include_removed)
+
+
+@app.post("/api/scan-records/removal-preview")
+def scan_removal_preview(payload: RemoveRunsInput, request: Request):
+    try:
+        return _store(request).scan_removal_preview(payload.run_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/scan-records")
+def remove_scan_records(payload: RemoveRunsInput, request: Request):
+    try:
+        result = _store(request).remove_recognition_runs(
+            payload.run_ids, payload.reason, reverse_posted=payload.reverse_posted,
+            idempotency_prefix=payload.idempotency_key or str(uuid.uuid4()),
+        )
+        _delete_managed_files(result.pop("paths_to_delete", []))
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/scan-assets/{asset_id}")
+def remove_scan_asset(asset_id: str, payload: ReasonInput, request: Request):
+    try:
+        result = _store(request).request_scan_asset_deletion(asset_id, payload.reason)
+        _delete_managed_files(result.pop("paths_to_delete", []))
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/recognition-runs/{run_id}/adoption")
+def cancel_recognition_adoption(run_id: str, request: Request):
+    try:
+        _store(request).cancel_run_adoption(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"status":"candidate"}
+
+
+@app.post("/api/recognition-runs/{run_id}/retry", status_code=202)
+def retry_recognition(run_id: str, request: Request):
+    try:
+        return request.app.state.scan_queue.retry(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/projects/{project_id}/recognition-runs")

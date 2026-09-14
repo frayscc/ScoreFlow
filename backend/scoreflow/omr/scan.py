@@ -118,7 +118,7 @@ class ScanQueue:
         suffix = Path(filename).suffix.lower()
         if suffix not in ALLOWED_EXTENSIONS:
             raise ValueError("仅支持 PDF、JPG、JPEG 和 PNG")
-        job_id = self.store.create_scan_job(project_id)
+        job_id = self.store.create_scan_job(project_id, filename)
         temp_dir = self.root / "imports" / "tmp"
         asset_dir = self.root / "imports" / "originals"
         temp_dir.mkdir(parents=True, exist_ok=True); asset_dir.mkdir(parents=True, exist_ok=True)
@@ -155,13 +155,30 @@ class ScanQueue:
             item = self.pending.get()
             if item is None:
                 self.pending.task_done(); return
-            job_id, asset_id, path = item
             try:
-                self._process(job_id, asset_id, path)
+                if item[0] == "retry":
+                    _, job_id, asset_id, path, run_id, page_index = item
+                    self._process_retry(job_id, asset_id, path, run_id, page_index)
+                else:
+                    job_id, asset_id, path = item
+                    self._process(job_id, asset_id, path)
             except Exception as exc:
                 self.store.update_scan_job(job_id, status="failed", stage="处理失败", error=str(exc))
             finally:
                 self.pending.task_done()
+
+    @staticmethod
+    def _unlink_paths(paths: list[str]) -> None:
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
+
+    def _finalize_requested_deletion(self, job_id: str, asset_id: str, completed_pages: int) -> bool:
+        if not self.store.scan_asset_delete_requested(asset_id):
+            return False
+        result = self.store.finalize_requested_asset_deletion(asset_id)
+        self._unlink_paths(result.get("paths_to_delete", []))
+        self.store.update_scan_job(job_id, status="cancelled", stage="已取消并删除", completed_pages=completed_pages)
+        return True
 
     def shutdown(self) -> None:
         # Ask queued/running jobs to stop at the next safe page boundary. The
@@ -171,54 +188,90 @@ class ScanQueue:
         self.pending.put(None)
         self.thread.join(timeout=10)
 
+    def retry(self, run_id: str) -> dict[str, Any]:
+        info = self.store.prepare_recognition_retry(run_id)
+        if info.get("old_corrected_path"):
+            Path(str(info["old_corrected_path"])).unlink(missing_ok=True)
+        try:
+            self.pending.put_nowait(("retry", info["job_id"], info["asset_id"], Path(str(info["stored_path"])), run_id, info["page_index"]))
+        except queue.Full as exc:
+            self.store.update_recognition_run(run_id, status="failed", error="处理队列已满，请稍后重试")
+            self.store.update_scan_job(str(info["job_id"]), status="failed", stage="队列已满", error="请等待现有任务完成")
+            raise ValueError("处理队列已满，请稍后重试") from exc
+        return {"status":"queued", "job_id":info["job_id"], "run_id":run_id}
+
+    def _process_retry(self, job_id: str, asset_id: str, path: Path, run_id: str, page_index: int) -> None:
+        self.store.update_scan_job(job_id, status="processing", stage="重新识别页面")
+        page_image = next((image for index, image in pages_from_file(path) if index == page_index), None)
+        if page_image is None:
+            raise ValueError("找不到要重新识别的原始页")
+        if self._recognize_page(job_id, asset_id, run_id, page_index, page_image):
+            return
+        self.store.update_scan_job(job_id, status="completed", stage="等待复核")
+
     def _process(self, job_id: str, asset_id: str, path: Path):
         self.store.update_scan_job(job_id, status="processing", stage="栅格化")
+        if self._finalize_requested_deletion(job_id, asset_id, 0):
+            return
         pages = list(pages_from_file(path)) if path.suffix.lower() != ".pdf" else pages_from_file(path)
         total = len(pdfium.PdfDocument(path)) if path.suffix.lower() == ".pdf" else 1
         if total > MAX_PAGES: raise ValueError(f"PDF超过{MAX_PAGES}页限制")
         self.store.update_scan_job(job_id, status="processing", stage="识别页面", total_pages=total)
         for completed, (page_index, image) in enumerate(pages, start=1):
             if self.store.get_scan_job(job_id)["cancel_requested"]:
+                if self._finalize_requested_deletion(job_id, asset_id, completed - 1):
+                    return
                 self.store.update_scan_job(job_id, status="cancelled", stage="已取消", completed_pages=completed - 1)
                 return
             run_id = self.store.create_recognition_run(asset_id, page_index)
-            self.store.update_recognition_run(run_id, status="processing")
-            identity, oriented, rotation = decode_identity(image)
-            if not identity:
-                self.store.update_recognition_run(run_id, status="needs_identity", quality={"rotation": rotation, **quality_metrics(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))})
-                self.store.update_scan_job(job_id, status="processing", stage="需要确认页面身份", completed_pages=completed)
-                continue
-            asset = self.store.get_run(run_id)
-            if identity.get("project_id") != asset["project_id"]:
-                self.store.update_recognition_run(run_id, status="failed", error="页面属于其他项目")
-                self.store.update_scan_job(job_id, status="processing", stage="发现错误项目页面", completed_pages=completed)
-                continue
-            sheet_id, side = identity.get("sheet_id"), identity.get("side")
-            try:
-                info = self.store.paper_download_info(sheet_id)
-                if info["project_id"] != asset["project_id"]: raise ValueError("页面属于其他项目")
-                manifest_path = self.root / "projects" / info["project_id"] / "papers" / f"paper-{info['sheet_number']:02d}-{sheet_id}.manifest.json"
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if identity.get("period_id") != info["period_id"] or identity.get("layout_hash") != manifest["layout_hash"][:16]:
-                    raise ValueError("页面周期或模板版本不匹配")
-                aligned = align_with_markers(oriented, manifest, side)
-                corrected_dir = self.root / "imports" / "corrected"; corrected_dir.mkdir(parents=True, exist_ok=True)
-                corrected_path = corrected_dir / f"{run_id}.png"
-                cv2.imwrite(str(corrected_path), aligned)
-                result = recognize_aligned(corrected_path, manifest_path, side)
-                slots = {slot["slot_id"]: slot for slot in manifest["sides"][side]["slots"]}
-                scores = {rule["index"]: rule["unit_score"] for rule in manifest["sides"][side]["rules"]}
-                predicted_delta = sum(scores[slots[item["slot_id"]]["rule_index"]] for item in result["observations"] if item["classification"].startswith("slash_"))
-                quality = {"rotation": rotation, **quality_metrics(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)), "counts": result["counts"], "predicted_delta":predicted_delta}
-                self.store.save_observations(run_id, result["observations"])
-                previous_side_status = self.store.mark_side_candidate(sheet_id, side)
-                if previous_side_status == "confirmed_blank" and sum(value for key,value in result["counts"].items() if key != "blank"):
-                    quality["problems"].append("与此前的空白面确认冲突")
-                self.store.update_recognition_run(run_id, status="ready", sheet_id=sheet_id, side=side, corrected_path=str(corrected_path), quality=quality)
-            except Exception as exc:
-                self.store.update_recognition_run(run_id, status="failed", sheet_id=sheet_id, side=side, error=str(exc))
+            if self._recognize_page(job_id, asset_id, run_id, page_index, image, completed):
+                return
             self.store.update_scan_job(job_id, status="processing", stage="识别页面", completed_pages=completed)
+            if self._finalize_requested_deletion(job_id, asset_id, completed):
+                return
         self.store.update_scan_job(job_id, status="completed", stage="等待复核", completed_pages=total)
+
+    def _recognize_page(self, job_id: str, asset_id: str, run_id: str, page_index: int,
+                        image: np.ndarray, completed: int = 0) -> bool:
+        self.store.update_recognition_run(run_id, status="processing")
+        identity, oriented, rotation = decode_identity(image)
+        if not identity:
+            self.store.update_recognition_run(run_id, status="needs_identity", quality={"rotation": rotation, **quality_metrics(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))})
+            self.store.update_scan_job(job_id, status="processing", stage="需要确认页面身份", completed_pages=completed or None)
+            return self._finalize_requested_deletion(job_id, asset_id, max(0, completed))
+        asset = self.store.get_run(run_id)
+        if identity.get("project_id") != asset["project_id"]:
+            self.store.update_recognition_run(run_id, status="failed", error="页面属于其他项目")
+            self.store.update_scan_job(job_id, status="processing", stage="发现错误项目页面", completed_pages=completed or None)
+            return self._finalize_requested_deletion(job_id, asset_id, max(0, completed))
+        sheet_id, side = identity.get("sheet_id"), identity.get("side")
+        try:
+            info = self.store.paper_download_info(sheet_id)
+            if info["project_id"] != asset["project_id"]: raise ValueError("页面属于其他项目")
+            manifest_path = self.root / "projects" / info["project_id"] / "papers" / f"paper-{info['sheet_number']:02d}-{sheet_id}.manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if identity.get("period_id") != info["period_id"] or identity.get("layout_hash") != manifest["layout_hash"][:16]:
+                raise ValueError("页面周期或模板版本不匹配")
+            aligned = align_with_markers(oriented, manifest, side)
+            corrected_dir = self.root / "imports" / "corrected"; corrected_dir.mkdir(parents=True, exist_ok=True)
+            corrected_path = corrected_dir / f"{run_id}.png"
+            cv2.imwrite(str(corrected_path), aligned)
+            result = recognize_aligned(corrected_path, manifest_path, side)
+            if self.store.scan_asset_delete_requested(asset_id):
+                corrected_path.unlink(missing_ok=True)
+                return self._finalize_requested_deletion(job_id, asset_id, max(0, completed - 1))
+            slots = {slot["slot_id"]: slot for slot in manifest["sides"][side]["slots"]}
+            scores = {rule["index"]: rule["unit_score"] for rule in manifest["sides"][side]["rules"]}
+            predicted_delta = sum(scores[slots[item["slot_id"]]["rule_index"]] for item in result["observations"] if item["classification"].startswith("slash_"))
+            quality = {"rotation": rotation, **quality_metrics(cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)), "counts": result["counts"], "predicted_delta":predicted_delta}
+            self.store.save_observations(run_id, result["observations"])
+            previous_side_status = self.store.mark_side_candidate(sheet_id, side)
+            if previous_side_status == "confirmed_blank" and sum(value for key,value in result["counts"].items() if key != "blank"):
+                quality["problems"].append("与此前的空白面确认冲突")
+            self.store.update_recognition_run(run_id, status="ready", sheet_id=sheet_id, side=side, corrected_path=str(corrected_path), quality=quality)
+        except Exception as exc:
+            self.store.update_recognition_run(run_id, status="failed", sheet_id=sheet_id, side=side, error=str(exc))
+        return self._finalize_requested_deletion(job_id, asset_id, max(0, completed))
 
     def resolve_identity(self, run_id: str, sheet_id: str, side: str) -> None:
         if side not in {"front", "back"}: raise ValueError("面别无效")

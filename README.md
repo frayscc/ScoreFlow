@@ -34,6 +34,8 @@ Windows x64 的同源构建脚本为 `scripts/build_windows.ps1`，但当前 Mac
 
 现在可以实际操作：建立班级、自定义组数、导入名单、自定义周期周次与积分项目、签发或下载纸表、生成补充表、导入扫描 PDF/图片、查看质量提示、人工确认疑点、选择扫描版本、整表入账、撤销纠错、关闭周期，并导出教师存档版或教室展示版 PDF。
 
+“导入记录”按文件和 PDF 页管理扫描，可筛选状态、重新识别、取消确认、删除单页或批量移除。未入账测试记录删除后可重导同一文件；已入账记录必须撤销整表入账，系统会保留审计证据。删除扫描永远不会删除已签发的纸表。
+
 界面中的“完整备份与跨电脑恢复”可直接生成 `.scorepack`。它是未加密 ZIP，包含一致性 SQLite 快照、纸表和版式 manifest、原始扫描、校正证据及报告；恢复前会校验路径、体积、版本、SHA-256、SQLite 完整性和引用文件。恢复始终建立独立项目，遇到同一项目身份会拒绝覆盖。
 
 ## 开发运行
@@ -80,6 +82,7 @@ npm --prefix frontend run build
 Phase 3 的实现与验收范围见 [Phase 3 验证报告](docs/phase3-test-report.md)。
 Phase 4 的实现与验收范围见 [Phase 4 验证报告](docs/phase4-test-report.md)。
 Phase 5 的实现、便携包状态与验收范围见 [Phase 5 验证报告](docs/phase5-test-report.md)。
+V2 名单与分组见 [V2-1 验证报告](docs/v2-1-test-report.md)，扫描导入记录管理见 [V2-2 验证报告](docs/v2-2-test-report.md)。
 
 ## 开源许可
 

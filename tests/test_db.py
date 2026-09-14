@@ -110,13 +110,24 @@ def test_schema_v6_upgrades_to_phase4_ledger_tables(tmp_path):
         store.connection.execute("DROP TABLE period_draft_members")
         store.connection.execute("DROP TABLE period_grouping_revisions")
         store.connection.execute("ALTER TABLE students DROP COLUMN is_unassigned")
+        store.connection.execute("ALTER TABLE scan_assets DROP COLUMN delete_requested")
+        store.connection.execute("ALTER TABLE recognition_runs DROP COLUMN removed_at")
+        store.connection.execute("ALTER TABLE recognition_runs DROP COLUMN removal_reason")
+        store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN scan_asset_id")
+        store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN is_duplicate")
+        store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN original_filename")
+        store.connection.execute("ALTER TABLE scan_jobs DROP COLUMN sha256")
         store.connection.execute("UPDATE schema_version SET version=6")
         store.connection.execute("PRAGMA user_version=6")
     store.close()
     upgraded = Store(path)
-    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert upgraded.connection.execute("PRAGMA user_version").fetchone()[0] == 10
     tables = {row[0] for row in upgraded.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"posting_batches", "ledger_entries", "report_exports"}.issubset(tables)
     columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(posting_batches)")}
     assert {"front_run_id", "back_run_id"}.issubset(columns)
+    run_columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(recognition_runs)")}
+    assert {"removed_at", "removal_reason"}.issubset(run_columns)
+    job_columns = {row[1] for row in upgraded.connection.execute("PRAGMA table_info(scan_jobs)")}
+    assert {"scan_asset_id", "is_duplicate", "original_filename", "sha256"}.issubset(job_columns)
     assert upgraded.connection.execute("SELECT count(*) FROM period_grouping_revisions").fetchone()[0] == 0
